@@ -3,7 +3,9 @@ import pandas as pd
 import numpy as np
 import re
 import pymorphy2
+import html
 import gensim
+import requests
 
 from tqdm import tqdm
 from pymystem3 import Mystem
@@ -13,6 +15,37 @@ from collections import Counter
 from gensim.models.doc2vec import Doc2Vec, TaggedDocument
 from stop_words import get_stop_words
 from razdel import tokenize as razdel_tokenize
+from razdel import sentenize
+
+from natasha import (
+    Segmenter,
+    MorphVocab,
+    
+    NewsEmbedding,
+    NewsMorphTagger,
+    
+    NewsNERTagger,
+
+    PER,
+    DatesExtractor,
+    MoneyExtractor,
+    AddrExtractor,
+    
+    Doc
+)
+
+
+morph_vocab = MorphVocab()
+
+
+segmenter = Segmenter()
+emb = NewsEmbedding()
+morph_tagger = NewsMorphTagger(emb)
+
+dates_extractor = DatesExtractor(morph_vocab)
+money_extractor = MoneyExtractor(morph_vocab)
+addr_extractor = AddrExtractor(morph_vocab)
+ner_tagger = NewsNERTagger(emb)
 
 
 russian_stopwords = get_stop_words('ru')
@@ -46,19 +79,38 @@ class Analyzer(object):
                          'POS_COMP']
 
     def tokenize_text(self, text):
-        text = re.sub(r'[\)\(»«:.,/;•!Ð£Ñ‡²µÑ¶"=%\^…]+', '', text)
+        text = re.sub(r'[\)\(»«:.,/;•!Ð£©Ñ‡²µÑ¶"=%\\^…]+', '', text)
         text = re.sub(r'[_—–]+', ' ', text)
         tokenized_text = [word.text.strip(punctuation) for word in razdel_tokenize(text)]
         tokenized_text = [word.lower() for word in tokenized_text if word and word not in self.punc]
-        return ' '.join(tokenized_text)
+        return tokenized_text
 
-    def lemmatize_text(self, text):
-        tokenized_text = self.tokenize_text(text).split()
-        normalized_text = [self.morph.parse(word)[0].normal_form for word in tokenized_text]
+    def lemmatize_text(self, text_tokens):
+        #tokenized_text = self.tokenize_text(text).split()
+        normalized_text = []
+        for word in text_tokens:
+            try:
+                token = self.morph.parse(word)[0].normal_form
+                normalized_text.append(token)
+            except:
+                continue
         return ' '.join(normalized_text)
+    
+    def ner_text_natasha(self, text):
+        doc = Doc(text)
+        doc.segment(segmenter)
+        doc.tag_ner(ner_tagger)
+        return len(doc.spans)
 
     def return_pos(self, text):
-        tokens_pos = [self.morph.parse(token.text)[0].tag.POS for token in razdel_tokenize(text) if token.text.strip() not in self.punc]
+        tokens_pos = []
+        for token in razdel_tokenize(text):
+            if token.text.strip() not in self.punc:
+                try:
+                    token = self.morph.parse(token.text)[0].tag.POS
+                    tokens_pos.append(token)
+                except:
+                    continue
         return tokens_pos
 
     def return_sent_from_pos(self, tokens_pos):
@@ -80,6 +132,15 @@ class Analyzer(object):
         elif type_ == 'cons' and lang_ == 'en':
             letters = re.findall(r'[BCDFGHJKLMNPQRSTVWXZbcdfghjklmnpqrstvwxz]{1}', text)
         return len(letters)
+    
+    def count_gram_err(self, text):
+        url = "https://orfo-rus.nanosemantics.ai/execute/"
+        errors = ''
+        t = [o.text for o in list(sentenize(text))]
+        for sentence in t:
+            response = requests.request("POST", url, data=sentence.encode('utf-8')).text
+            errors += response
+        return errors.count('id')
 
     def len_text(self, text):
         return len(text)
@@ -88,7 +149,7 @@ class Analyzer(object):
         return np.mean([self.count_letters(word.text, type_, lang_) for word in razdel_tokenize(text)])
 
     def count_punct(self, text):
-        return len(re.findall('[‟„”“№!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~«»―]+', text))
+        return len(re.findall('[‟„”“№!"#$%&\'()©*+,-./:;<=>?@[\\]^_`{|}~«»―]+', text))
 
     def count_numbers(self, text):
         return len(re.findall(r'[0-9]+', text))
@@ -138,6 +199,7 @@ class Analyzer(object):
                 ord('\uf02b'): '',
                 ord('\u00ad'): '',
                 ord('\uf053'): '',
+                ord('\xa0'): ' '
                }
 
         text = text.translate(map_)
@@ -146,25 +208,29 @@ class Analyzer(object):
     def preprocess_pipeline(self, df):
         df[self.analyzed_col].fillna('', inplace=True)
         df[self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.remove_invalid_symb(str(x)))
-        df['lemm_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda text: self.lemmatize_text(text))
+        df[self.analyzed_col] = df[self.analyzed_col].apply(lambda x: html.unescape(x))
+        df['tokens_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.tokenize_text(x))
+        df['lemm_' + self.analyzed_col] = df['tokens_' + self.analyzed_col].apply(lambda text: self.lemmatize_text(text))
         print('Text lemmatized and trash removed...')
        
-        df['len_text_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.len_text(x))
-        df['count_punct_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_punct(x)) / df['len_text_' + self.analyzed_col]
-        df['count_numbers_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_numbers(x)) / df['len_text_' + self.analyzed_col]
-        df['count_digits_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_digits(x)) / df['len_text_' + self.analyzed_col]
-        df['count_uppercase_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_uppercase(x)) / df['len_text_' + self.analyzed_col]
-        df['count_lowercase_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_lowercase(x)) / df['len_text_' + self.analyzed_col]
+        df['len_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.len_text(x))
+        df['unique_tokens_' + self.analyzed_col] = df['tokens_' + self.analyzed_col].apply(lambda x: len(set(x)))  / df['tokens_' + self.analyzed_col].apply(len)
+        df['count_punct_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_punct(x)) / df['len_' + self.analyzed_col]
+        df['count_numbers_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_numbers(x)) / df['len_' + self.analyzed_col]
+        df['count_digits_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_digits(x)) / df['len_' + self.analyzed_col]
+        df['count_uppercase_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_uppercase(x)) / df['len_' + self.analyzed_col]
+        df['count_lowercase_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_lowercase(x)) / df['len_' + self.analyzed_col]
         df['avg_word_len_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.avg_word_len(x))
         df['mean_ru_vowel_occurance_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda text: self.mean_letter_occurance(text, 'vowel', 'ru'))
         df['mean_ru_consonant_occurance_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda text: self.mean_letter_occurance(text, 'cons', 'ru'))
         df['mean_en_vowel_occurance_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda text: self.mean_letter_occurance(text, 'vowel', 'en'))
         df['mean_en_consonant_occurance_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda text: self.mean_letter_occurance(text, 'cons', 'en'))
-        df['count_space_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_space(x)) / df['len_text_' + self.analyzed_col]
+        df['count_space_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_space(x)) / df['len_' + self.analyzed_col]
                                              
-        df['count_kirr_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_kirr(x)) / df['len_text_' + self.analyzed_col]
-        df['count_lat_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_lat(x)) / df['len_text_' + self.analyzed_col]        
-        
+        df['count_kirr_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_kirr(x)) / df['len_' + self.analyzed_col]
+        df['count_lat_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_lat(x)) / df['len_' + self.analyzed_col]
+        df['ner_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.ner_text_natasha(x)) / df['tokens_' + self.analyzed_col ].apply(len)
+        #df['gram_err_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.count_gram_err(x)) / df['len_' + self.analyzed_col]
         print('Features is calculated...')
 
         df['POS_' + self.analyzed_col] = df[self.analyzed_col].apply(lambda x: self.return_pos(x))
@@ -299,7 +365,7 @@ class Analyzer(object):
     def data_processing(self, data, analyzed_col):
         self.analyzed_col = analyzed_col
         data = self.preprocess_pipeline(data)
-        data = self.add_d2v_vectors(data)
+        #data = self.add_d2v_vectors(data)
         data = self.postprocess(data)
         return data
     
